@@ -105,66 +105,31 @@ function setChecking() {
   troubleSection.style.display = 'none';
 }
 
-// Check connection using PING/PONG
+// Check connection through the background worker so the popup wakes the path /annotate uses
 function checkConnection() {
   setChecking();
-  
-  let resolved = false;
-  let port = null;
-  
-  const cleanup = () => {
-    try { if (port) port.disconnect(); } catch {}
-  };
-  
-  const timeout = setTimeout(() => {
-    if (!resolved) {
-      resolved = true;
-      cleanup();
-      setTrouble('Timeout - native host not responding');
+
+  chrome.runtime.sendMessage({ type: 'CHECK_CONNECTION' }, (response) => {
+    const error = chrome.runtime.lastError?.message;
+    if (error) {
+      setTrouble(error);
+      return;
     }
-  }, 3000);
-  
-  try {
-    port = chrome.runtime.connectNative('com.pi.annotate');
-    
-    port.onDisconnect.addListener(() => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      
-      const error = chrome.runtime.lastError?.message || '';
-      if (error.includes('not found')) {
-        setNotInstalled('Native host not found');
-      } else if (error.includes('forbidden')) {
-        setNotInstalled('Extension ID mismatch - reinstall native host');
-      } else if (error) {
-        setTrouble(error);
-      } else {
-        // Disconnected without error but no PONG received - host may have crashed
-        setTrouble('Native host disconnected unexpectedly');
-      }
-    });
-    
-    port.onMessage.addListener((msg) => {
-      if (msg?.type === 'PONG') {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-        setConnected();
-        cleanup();
-      }
-    });
-    
-    // Send PING
-    port.postMessage({ type: 'PING' });
-    
-  } catch (err) {
-    if (resolved) return;
-    resolved = true;
-    clearTimeout(timeout);
-    cleanup();
-    setTrouble(err.message);
-  }
+
+    if (response?.connected) {
+      setConnected();
+      return;
+    }
+
+    const detail = response?.error || 'Native host not responding';
+    if (detail.includes('not found')) {
+      setNotInstalled('Native host not found');
+    } else if (detail.includes('forbidden')) {
+      setNotInstalled('Extension ID mismatch - reinstall native host');
+    } else {
+      setTrouble(detail);
+    }
+  });
 }
 
 // Check on load
