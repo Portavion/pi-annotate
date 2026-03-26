@@ -6,6 +6,8 @@
  */
 
 let nativePort = null;
+let nativeProbe = null;
+let reconnectTimer = null;
 const requestTabs = new Map();
 
 function getRequestId(msg) {
@@ -17,7 +19,73 @@ function isRestrictedUrl(url) {
   return /^(chrome|chrome-extension|edge|about|devtools|view-source):/.test(url);
 }
 
+function clearReconnectTimer() {
+  if (!reconnectTimer) return;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    try {
+      connectNative();
+    } catch {}
+  }, 2000);
+}
+
+function finishNativeProbe(error) {
+  if (!nativeProbe) return;
+  clearTimeout(nativeProbe.timeoutId);
+  const { resolve, reject } = nativeProbe;
+  nativeProbe = null;
+  if (error) reject(error);
+  else resolve();
+}
+
+function ensureNativeConnection(timeoutMs = 3000) {
+  try {
+    connectNative();
+  } catch (err) {
+    return Promise.reject(err);
+  }
+
+  if (!nativePort) {
+    return Promise.reject(new Error("Native host not connected"));
+  }
+
+  if (nativeProbe) {
+    return nativeProbe.promise;
+  }
+
+  nativeProbe = {};
+  nativeProbe.promise = new Promise((resolve, reject) => {
+    nativeProbe.resolve = resolve;
+    nativeProbe.reject = reject;
+    nativeProbe.timeoutId = setTimeout(() => {
+      finishNativeProbe(new Error("Timeout - native host not responding"));
+    }, timeoutMs);
+  });
+
+  try {
+    nativePort.postMessage({ type: "PING" });
+  } catch (err) {
+    finishNativeProbe(err instanceof Error ? err : new Error(String(err)));
+  }
+
+  return nativeProbe.promise;
+}
+
 function sendToNative(msg) {
+  if (!nativePort) {
+    try {
+      connectNative();
+    } catch (err) {
+      console.error("[pi-annotate] Cannot connect to native host:", err?.message || err);
+      return;
+    }
+  }
   if (!nativePort) {
     console.error("[pi-annotate] Cannot send to native host - not connected");
     return;
@@ -93,10 +161,27 @@ async function togglePicker() {
 }
 
 function connectNative() {
+  if (nativePort) return nativePort;
+
+  clearReconnectTimer();
   console.log("[pi-annotate] Connecting to native host...");
-  nativePort = chrome.runtime.connectNative("com.pi.annotate");
+
+  try {
+    nativePort = chrome.runtime.connectNative("com.pi.annotate");
+  } catch (err) {
+    nativePort = null;
+    console.error("[pi-annotate] Failed to connect to native host:", err?.message || err);
+    scheduleReconnect();
+    throw err;
+  }
   
   nativePort.onMessage.addListener((msg) => {
+    if (msg?.type === "PONG") {
+      console.log("[pi-annotate] Native host responded to ping");
+      finishNativeProbe();
+      return;
+    }
+
     console.log("[pi-annotate] From native host:", msg);
     
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -155,15 +240,26 @@ function connectNative() {
   });
   
   nativePort.onDisconnect.addListener(() => {
-    console.log("[pi-annotate] Native host disconnected");
+    const error = chrome.runtime.lastError?.message;
+    console.log("[pi-annotate] Native host disconnected", error ? `: ${error}` : "");
+    finishNativeProbe(new Error(error || "Native host disconnected"));
     nativePort = null;
-    setTimeout(connectNative, 2000);
+    scheduleReconnect();
   });
+
+  return nativePort;
 }
 
 // Handle messages from content script and popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   console.log("[pi-annotate] Message:", msg.type);
+
+  if (msg.type === "CHECK_CONNECTION") {
+    ensureNativeConnection()
+      .then(() => sendResponse({ connected: true }))
+      .catch((err) => sendResponse({ connected: false, error: err?.message || "Unknown error" }));
+    return true;
+  }
   
   if (msg.type === "TOGGLE_PICKER") {
     togglePicker();
@@ -205,5 +301,7 @@ chrome.commands.onCommand.addListener((command) => {
 });
 
 // Connect on startup
-connectNative();
+try {
+  connectNative();
+} catch {}
 console.log("[pi-annotate] Background script loaded");
